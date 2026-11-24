@@ -1,0 +1,14 @@
+{
+  "name": "moonvane",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Moonvane \u2014 every moth seeks its moon. A cozy bearing puzzle.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "verify": "node tools/verify.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
