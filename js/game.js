@@ -1,4 +1,4 @@
-import { generateLevel, allSatisfied, CHAPTERS, VERSION } from "./engine.js";
+import { generateLevel, allSatisfied, CHAPTERS, VERSION, mothSatisfied } from "./engine.js";
 import { Renderer } from "./render.js";
 import { AudioEngine } from "./audio.js";
 import { load, persist } from "./save.js";
@@ -6,6 +6,18 @@ import { t, setLang, applyDir, detectLang, LANGS, LANG_NAMES } from "./i18n.js";
 import { getNative, isNative } from "./native.js";
 const $ = (id) => document.getElementById(id);
 const HINT_COST = 30;
+const MISSIONS = [
+    { id: "m1", goal: 25, reward: 30, get: g => g.save.stats.aligned },
+    { id: "m2", goal: 8, reward: 50, get: g => g.save.stats.perfect },
+    { id: "m3", goal: 300, reward: 80, get: g => g.save.level },
+    { id: "m4", goal: 8, reward: 40, get: g => g.save.stats.noHintWins },
+    { id: "m5", goal: 40, reward: 40, get: g => g.save.stats.played },
+    { id: "m6", goal: 3, reward: 50, get: g => g.save.stats.dailyDone },
+];
+function hashStr(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+} return h >>> 0; }
 export class Game {
     constructor(canvas) {
         this.placed = [];
@@ -19,6 +31,11 @@ export class Game {
         this.winsSinceAd = 0;
         this.time = 0;
         this.mapChapter = 0;
+        this.dailyMode = false;
+        this.hintUsed = false;
+        this.prevAligned = 0;
+        this.celebrateStart = -1;
+        this.combo = 0;
         this.save = load();
         const lang = this.save.lang || detectLang();
         setLang(lang);
@@ -41,26 +58,34 @@ export class Game {
             this.time += dt;
             if (this.hintT > 0)
                 this.hintT -= dt;
-            const st = { level: this.level, placed: this.placed, selected: this.selected, cb: this.save.cb, hint: this.hint, hintT: this.hintT, won: this.won, time: this.time };
+            let cel = 0;
+            if (this.celebrateStart >= 0) {
+                cel = Math.min(1, (this.time - this.celebrateStart) / 1.3);
+            }
+            const st = { level: this.level, placed: this.placed, selected: this.selected, cb: this.save.cb, hint: this.hint, hintT: this.hintT, won: this.won, time: this.time, reduceMotion: this.save.reduceMotion, celebrate: cel };
             this.renderer.frame(st, dt);
             requestAnimationFrame(loop);
         };
         requestAnimationFrame(loop);
     }
     bind() {
-        const on = (id, fn) => { $(id).addEventListener("click", () => { this.audio.init(); fn(); }); };
-        on("btnPlay", () => this.startLevel(this.save.level));
+        const on = (id, fn) => { const el = document.getElementById(id); if (el)
+            el.addEventListener("click", () => { this.audio.init(); fn(); }); };
+        on("btnPlay", () => { this.dailyMode = false; this.startLevel(this.save.level); });
         on("btnMap", () => this.openMap());
         on("btnSettings", () => this.showScreen("settings"));
         on("btnHelp", () => this.showScreen("help"));
         on("btnShop", () => this.openShop());
         on("btnDaily", () => this.claimDaily());
         on("btnBack", () => this.openMap());
+        on("btnMissions", () => this.openMissions());
+        on("btnMissionsBack", () => this.showScreen("home"));
+        on("btnDailyChallenge", () => this.startDaily());
         on("btnUndo", () => this.undo());
         on("btnReset", () => this.resetLevel());
         on("btnHint", () => this.useHint());
         on("btnNext", () => this.nextLevel());
-        on("btnReplay", () => this.startLevel(this.level.id));
+        on("btnReplay", () => { this.dailyMode = false; this.startLevel(this.level.id); });
         on("winMap", () => this.openMap());
         on("btnDouble", () => this.doubleGems());
         on("btnMapBack", () => this.showScreen("home"));
@@ -70,20 +95,31 @@ export class Game {
         on("btnRestore", () => this.restore());
         on("btnResetProgress", () => this.resetProgress());
         on("btnPrivacy", () => { window.location.href = "privacy.html"; });
+        on("coachBtn", () => { this.save.tutorialDone = true; persist(this.save); this.updateCoach(); });
         const cv = this.renderer.canvas;
         cv.addEventListener("pointerdown", (e) => { this.audio.init(); const r = cv.getBoundingClientRect(); const c = this.renderer.cellAt(e.clientX - r.left, e.clientY - r.top, this.level.size); if (c)
             this.tapCell(c.x, c.y); });
-        $("setSound").addEventListener("change", (e) => { this.save.sound = e.target.checked; this.audio.sound = this.save.sound; persist(this.save); });
-        $("setMusic").addEventListener("change", (e) => { this.save.music = e.target.checked; this.audio.init(); this.audio.setMusic(this.save.music); persist(this.save); });
-        $("setHaptics").addEventListener("change", (e) => { this.save.haptics = e.target.checked; persist(this.save); });
-        $("setCb").addEventListener("change", (e) => { this.save.cb = e.target.checked; persist(this.save); });
-        $("langSelect").addEventListener("change", (e) => { const v = e.target.value; this.save.lang = v; setLang(v); applyDir(); persist(this.save); this.applyI18n(); this.updateHome(); this.buildTray(); this.updateHUD(); });
+        const chk = (id, key) => { const el = document.getElementById(id); if (el)
+            el.addEventListener("change", () => { this.save[key] = el.checked; if (key === "sound")
+                this.audio.sound = el.checked; if (key === "music") {
+                this.audio.init();
+                this.audio.setMusic(el.checked);
+            } persist(this.save); }); };
+        chk("setSound", "sound");
+        chk("setMusic", "music");
+        chk("setHaptics", "haptics");
+        chk("setCb", "cb");
+        chk("setReduceMotion", "reduceMotion");
+        chk("setTips", "tips");
+        const ls = document.getElementById("langSelect");
+        if (ls)
+            ls.addEventListener("change", () => { const v = ls.value; this.save.lang = v; setLang(v); applyDir(); persist(this.save); this.applyI18n(); this.updateHome(); this.buildTray(); this.updateHUD(); });
     }
     haptic(k) { const n = getNative(); if (this.save.haptics && n)
         n.haptic(k);
     else if (this.save.haptics && navigator.vibrate)
         navigator.vibrate(k === "success" ? [20, 40, 20] : 12); }
-    showScreen(name) { document.querySelectorAll(".screen").forEach(s => s.classList.remove("active")); $(name).classList.add("active"); if (name === "game")
+    showScreen(name) { document.querySelectorAll(".screen").forEach(s => s.classList.remove("active")); const el = $(name); el.classList.add("active"); el.classList.remove("anim"); void el.offsetWidth; el.classList.add("anim"); if (name === "game")
         setTimeout(() => this.renderer.resize(), 30); }
     applyI18n() { document.querySelectorAll("[data-i18n]").forEach(el => { const k = el.getAttribute("data-i18n"); el.textContent = t(k); }); $("verLabel").textContent = t("version") + " " + VERSION; }
     buildLang() { const sel = $("langSelect"); sel.innerHTML = ""; for (const l of LANGS) {
@@ -94,12 +130,22 @@ export class Game {
             o.selected = true;
         sel.appendChild(o);
     } }
-    syncSettings() { $("setSound").checked = this.save.sound; $("setMusic").checked = this.save.music; $("setHaptics").checked = this.save.haptics; $("setCb").checked = this.save.cb; }
-    updateHome() { $("homeLevel").textContent = t("level") + " " + this.save.level + " · " + CHAPTERS[Math.floor((this.save.level - 1) / 100)]; $("homeGems").textContent = String(this.save.gems); const nat = isNative(); $("btnShop").style.display = nat ? "" : "none"; $("btnDaily").style.display = this.canDaily() ? "" : "none"; }
+    syncSettings() { const set = (id, v) => { const el = document.getElementById(id); if (el)
+        el.checked = v; }; set("setSound", this.save.sound); set("setMusic", this.save.music); set("setHaptics", this.save.haptics); set("setCb", this.save.cb); set("setReduceMotion", this.save.reduceMotion); set("setTips", this.save.tips); }
+    updateHome() { $("homeLevel").textContent = t("level") + " " + this.save.level + " · " + CHAPTERS[Math.floor((this.save.level - 1) / 100)]; $("homeGems").textContent = String(this.save.gems); const nat = isNative(); $("btnShop").style.display = nat ? "" : "none"; $("btnDaily").style.display = this.canDaily() ? "" : "none"; const done = this.save.stats.lastDailyDate === new Date().toISOString().slice(0, 10); const dc = document.getElementById("btnDailyChallenge"); if (dc) {
+        dc.style.display = "";
+        dc.classList.toggle("done", done);
+    } }
     canDaily() { return this.save.lastDaily !== new Date().toISOString().slice(0, 10); }
     claimDaily() { if (!this.canDaily())
         return; this.save.lastDaily = new Date().toISOString().slice(0, 10); this.save.gems += 25; persist(this.save); this.updateHome(); this.toast("+25 " + t("gems")); this.audio.lock(); }
-    startLevel(id) { this.level = generateLevel(id); this.placed = []; this.moves = 0; this.undoStack = []; this.won = false; this.hint = null; this.hintT = 0; this.renderer.angles = []; this.selected = this.level.inv.length ? { c: this.level.inv[0].c, k: this.level.inv[0].k } : null; this.buildTray(); this.updateHUD(); this.showScreen("game"); this.renderer.resize(); }
+    startLevel(id) { this.level = generateLevel(id); this.placed = []; this.moves = 0; this.undoStack = []; this.won = false; this.hint = null; this.hintT = 0; this.hintUsed = false; this.prevAligned = 0; this.combo = 0; this.celebrateStart = -1; this.renderer.angles = []; this.renderer.prevSat = []; this.selected = this.level.inv.length ? { c: this.level.inv[0].c, k: this.level.inv[0].k } : null; this.buildTray(); this.updateHUD(); this.showScreen("game"); this.renderer.resize(); this.updateCoach(); }
+    updateCoach() { const c = document.getElementById("coach"); if (!c)
+        return; const show = this.save.tips && !this.save.tutorialDone && this.level.id <= 3 && !this.won && !this.dailyMode; c.style.display = show ? "" : "none"; if (show) {
+        const txt = document.getElementById("coachText");
+        if (txt)
+            txt.textContent = this.placed.length === 0 ? t("tut1") : (this.moves === 0 ? t("tut2") : t("tut3"));
+    } }
     remaining(c, k) { const e = this.level.inv.find(x => x.c === c && x.k === k); const used = this.placed.filter(o => o.c === c && o.k === k).length; return (e ? e.n : 0) - used; }
     buildTray() { const tray = $("tray"); tray.innerHTML = ""; for (const e of this.level.inv) {
         const b = document.createElement("button");
@@ -120,10 +166,13 @@ export class Game {
         b.addEventListener("click", () => { this.selected = { c: e.c, k: e.k }; this.buildTray(); });
         tray.appendChild(b);
     } }
-    updateHUD() { $("hudLevel").textContent = t("level") + " " + this.level.id; $("hudChapter").textContent = CHAPTERS[this.level.chapter]; $("hudGems").textContent = String(this.save.gems); $("hudMoves").textContent = t("moves") + " " + this.moves; $("hudPar").textContent = t("par") + " " + this.level.par; $("hintCost").textContent = HINT_COST + "◆"; }
+    updateHUD() { $("hudLevel").textContent = (this.dailyMode ? t("daily") : t("level") + " " + this.level.id); $("hudChapter").textContent = CHAPTERS[this.level.chapter]; $("hudGems").textContent = String(this.save.gems); $("hudMoves").textContent = t("moves") + " " + this.moves; $("hudPar").textContent = t("par") + " " + this.level.par; $("hintCost").textContent = HINT_COST + "◆"; }
     occupied(x, y) { return this.level.fixed.some(o => o.x === x && o.y === y) || this.placed.some(o => o.x === x && o.y === y); }
     isBlocked(x, y) { return this.level.blocked.includes(y * this.level.size + x); }
     isMoth(x, y) { return this.level.moths.some(m => m.x === x && m.y === y); }
+    alignedCount() { const objs = this.level.fixed.concat(this.placed); let n = 0; for (const m of this.level.moths)
+        if (mothSatisfied(m, objs))
+            n++; return n; }
     tapCell(x, y) {
         if (this.won)
             return;
@@ -135,12 +184,15 @@ export class Game {
             this.undoStack.push({ type: "remove", obj });
             this.audio.remove();
             this.haptic("light");
+            this.combo = 0;
             this.buildTray();
             this.updateHUD();
+            this.updateCoach();
             return;
         }
         if (this.isBlocked(x, y) || this.isMoth(x, y) || this.occupied(x, y)) {
             this.audio.error();
+            this.renderer.shake = 4;
             return;
         }
         if (!this.selected || this.remaining(this.selected.c, this.selected.k) <= 0) {
@@ -154,13 +206,21 @@ export class Game {
         this.undoStack.push({ type: "place", obj });
         this.audio.place();
         this.haptic("medium");
-        this.renderer.burst(x, y, ["#ffcf6b", "#ff8fb1", "#b79cff"][obj.c], 8);
+        this.renderer.burst(x, y, ["#ffcf6b", "#ff8fb1", "#b79cff"][obj.c], 10);
         if (this.remaining(obj.c, obj.k) <= 0) {
             const nxt = this.level.inv.find(e => this.remaining(e.c, e.k) > 0);
             this.selected = nxt ? { c: nxt.c, k: nxt.k } : null;
         }
         this.buildTray();
         this.updateHUD();
+        const ac = this.alignedCount();
+        if (ac > this.prevAligned) {
+            this.combo = ac;
+            this.audio.align(this.combo);
+            this.haptic("light");
+        }
+        this.prevAligned = ac;
+        this.updateCoach();
         this.checkWin();
     }
     undo() { const a = this.undoStack.pop(); if (!a)
@@ -171,14 +231,14 @@ export class Game {
     }
     else {
         this.placed.push(a.obj);
-    } this.moves++; this.audio.remove(); this.buildTray(); this.updateHUD(); }
-    resetLevel() { this.placed = []; this.moves = 0; this.undoStack = []; this.won = false; this.hint = null; this.selected = this.level.inv.length ? { c: this.level.inv[0].c, k: this.level.inv[0].k } : null; this.buildTray(); this.updateHUD(); }
+    } this.moves++; this.audio.remove(); this.prevAligned = this.alignedCount(); this.buildTray(); this.updateHUD(); }
+    resetLevel() { this.placed = []; this.moves = 0; this.undoStack = []; this.won = false; this.hint = null; this.hintUsed = false; this.prevAligned = 0; this.combo = 0; this.celebrateStart = -1; this.selected = this.level.inv.length ? { c: this.level.inv[0].c, k: this.level.inv[0].k } : null; this.buildTray(); this.updateHUD(); this.updateCoach(); }
     useHint() {
         const nat = getNative();
         const reveal = () => { const sol = this.level.solution.find(o => !this.placed.some(p => p.x === o.x && p.y === o.y && p.c === o.c && p.k === o.k)); if (!sol) {
             this.toast(t("allAligned"));
             return;
-        } this.hint = { x: sol.x, y: sol.y }; this.hintT = 3.5; this.audio.lock(); };
+        } this.hint = { x: sol.x, y: sol.y }; this.hintT = 3.5; this.hintUsed = true; this.save.stats.hints++; persist(this.save); this.audio.lock(); };
         if (this.save.gems >= HINT_COST) {
             this.save.gems -= HINT_COST;
             persist(this.save);
@@ -202,24 +262,64 @@ export class Game {
         if (!allSatisfied(this.level, this.placed))
             return;
         this.won = true;
+        this.celebrateStart = this.time;
         const s = this.stars();
-        const prev = this.save.stars[this.level.id] || 0;
-        this.save.stars[this.level.id] = Math.max(prev, s);
-        const reward = 8 + s * 4 + (prev === 0 ? 6 : 0);
+        this.save.stats.aligned += this.level.moths.length;
+        this.save.stats.played++;
+        if (s === 3)
+            this.save.stats.perfect++;
+        if (!this.hintUsed)
+            this.save.stats.noHintWins++;
+        if (this.level.solution.some(o => o.k === 1) || this.level.fixed.some(o => o.k === 1))
+            this.save.stats.batWins++;
+        let reward = 8 + s * 4;
+        let chapterBonus = 0;
+        if (this.dailyMode) {
+            const today = new Date().toISOString().slice(0, 10);
+            if (this.save.stats.lastDailyDate !== today) {
+                const yest = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+                this.save.stats.streak = this.save.stats.lastDailyDate === yest ? this.save.stats.streak + 1 : 1;
+                this.save.stats.bestStreak = Math.max(this.save.stats.bestStreak, this.save.stats.streak);
+                this.save.stats.lastDailyDate = today;
+                this.save.stats.dailyDone++;
+                reward += 40;
+            }
+        }
+        else {
+            const prev = this.save.stars[this.level.id] || 0;
+            this.save.stars[this.level.id] = Math.max(prev, s);
+            if (prev === 0)
+                reward += 6;
+            if (this.save.level <= this.level.id)
+                this.save.level = Math.min(1000, this.level.id + 1);
+            if (this.level.id % 100 === 0) {
+                chapterBonus = 50;
+                reward += chapterBonus;
+            }
+        }
         this.save.gems += reward;
         this.save.wins++;
         this.winsSinceAd++;
-        if (this.save.level <= this.level.id)
-            this.save.level = Math.min(1000, this.level.id + 1);
         persist(this.save);
         this.audio.win();
+        if (chapterBonus || this.dailyMode)
+            this.audio.fanfare();
         this.haptic("success");
         for (const m of this.level.moths)
-            this.renderer.burst(m.x, m.y, ["#ffcf6b", "#ff8fb1", "#b79cff"][m.c], 10);
-        $("winStars").textContent = "★".repeat(s) + "☆".repeat(3 - s);
+            this.renderer.burst(m.x, m.y, ["#ffcf6b", "#ff8fb1", "#b79cff"][m.c], 12);
+        const ws = $("winStars");
+        ws.textContent = "★".repeat(s) + "☆".repeat(3 - s);
+        ws.classList.remove("pop");
+        void ws.offsetWidth;
+        ws.classList.add("pop");
         $("winTitle").textContent = s === 3 ? t("perfect") : s === 2 ? t("great") : t("good");
-        $("winSub").textContent = t("winSub");
-        $("winGems").textContent = "+" + reward + " ◆";
+        $("winSub").textContent = this.dailyMode ? (t("streak") + ": " + this.save.stats.streak + " 🔥") : t("winSub");
+        this.countUp($("winGems"), reward);
+        const cb = document.getElementById("chapterBanner");
+        if (cb) {
+            cb.style.display = chapterBonus ? "" : "none";
+            cb.textContent = t("chapterComplete") + " +50 ◆";
+        }
         $("btnDouble").style.display = isNative() ? "" : "none";
         this.showScreen("win");
         this.updateHome();
@@ -229,7 +329,16 @@ export class Game {
             nat.showInterstitial().catch(() => undefined);
         }
     }
-    nextLevel() { const id = Math.min(1000, this.level.id + 1); this.startLevel(id); }
+    countUp(el, target) { let v = 0; const step = Math.max(1, Math.round(target / 24)); const iv = setInterval(() => { v += step; if (v >= target) {
+        v = target;
+        clearInterval(iv);
+    } el.textContent = "+" + v + " ◆"; }, 28); }
+    nextLevel() { if (this.dailyMode) {
+        this.dailyMode = false;
+        this.showScreen("home");
+        this.updateHome();
+        return;
+    } const id = Math.min(1000, this.level.id + 1); this.startLevel(id); }
     doubleGems() { const nat = getNative(); if (!nat)
         return; nat.showRewarded().then(ok => { if (ok) {
         this.save.gems += 20;
@@ -240,6 +349,10 @@ export class Game {
     }
     else
         this.toast(t("adFail")); }); }
+    startDaily() { const today = new Date().toISOString().slice(0, 10); if (this.save.stats.lastDailyDate === today) {
+        this.toast(t("claimed"));
+        return;
+    } this.dailyMode = true; const id = 400 + (hashStr(today) % 400); this.startLevel(id); }
     openMap() { this.mapChapter = Math.floor((this.save.level - 1) / 100); this.buildMap(); this.showScreen("map"); }
     buildMap() {
         $("mapTitle").textContent = t("chapter") + " " + (this.mapChapter + 1) + " · " + CHAPTERS[this.mapChapter];
@@ -271,9 +384,68 @@ export class Game {
             b.appendChild(s);
             if (st)
                 b.classList.add("done");
-            b.addEventListener("click", () => this.startLevel(id));
+            b.addEventListener("click", () => { this.dailyMode = false; this.startLevel(id); });
             grid.appendChild(b);
         }
+    }
+    openMissions() {
+        const list = $("missionsList");
+        list.innerHTML = "";
+        for (const m of MISSIONS) {
+            const cur = Math.min(m.get(this), m.goal);
+            const done = cur >= m.goal;
+            const claimed = this.save.claimed.includes(m.id);
+            const row = document.createElement("div");
+            row.className = "mission" + (claimed ? " claimed" : "");
+            const info = document.createElement("div");
+            info.className = "m-info";
+            const name = document.createElement("div");
+            name.className = "m-name";
+            name.textContent = t(m.id);
+            info.appendChild(name);
+            const desc = document.createElement("div");
+            desc.className = "m-desc";
+            desc.textContent = t((m.id + "d"));
+            info.appendChild(desc);
+            const bar = document.createElement("div");
+            bar.className = "m-bar";
+            const fill = document.createElement("div");
+            fill.className = "m-fill";
+            fill.style.width = Math.round(cur / m.goal * 100) + "%";
+            bar.appendChild(fill);
+            info.appendChild(bar);
+            const prog = document.createElement("div");
+            prog.className = "m-prog";
+            prog.textContent = cur + " / " + m.goal;
+            info.appendChild(prog);
+            row.appendChild(info);
+            const btn = document.createElement("button");
+            btn.className = "btn small gold m-claim";
+            btn.textContent = claimed ? "✓" : (t("claim") + " +" + m.reward);
+            btn.disabled = !done || claimed;
+            btn.addEventListener("click", () => { if (done && !claimed) {
+                this.save.claimed.push(m.id);
+                this.save.gems += m.reward;
+                persist(this.save);
+                this.audio.fanfare();
+                this.haptic("success");
+                this.updateHome();
+                this.openMissions();
+                this.toast("+" + m.reward + " ◆");
+            } });
+            row.appendChild(btn);
+            list.appendChild(row);
+        }
+        const sb = $("statsBox");
+        sb.innerHTML = "";
+        const rows = [[t("aligned"), this.save.stats.aligned], [t("perfect"), this.save.stats.perfect], [t("played"), this.save.stats.played], [t("bestStreak"), this.save.stats.bestStreak]];
+        for (const [label, val] of rows) {
+            const d = document.createElement("div");
+            d.className = "stat";
+            d.innerHTML = "<span>" + label + "</span><b>" + val + "</b>";
+            sb.appendChild(d);
+        }
+        this.showScreen("missions");
     }
     openShop() { const nat = getNative(); if (!nat) {
         this.showScreen("home");
@@ -296,6 +468,6 @@ export class Game {
     restore() { const nat = getNative(); if (!nat)
         return; nat.restore().then(ok => this.toast(ok ? t("restored") : t("purchaseFail"))); }
     resetProgress() { if (!confirm(t("confirmReset")))
-        return; const lang = this.save.lang; this.save = Object.assign(this.save, { level: 1, stars: {}, gems: 60, wins: 0, lastDaily: "", noAds: false, lang }); persist(this.save); this.updateHome(); this.toast(t("resetProgress")); }
+        return; const lang = this.save.lang; this.save = Object.assign(this.save, { level: 1, stars: {}, gems: 60, wins: 0, lastDaily: "", noAds: false, lang, tutorialDone: false, claimed: [] }); this.save.stats = { aligned: 0, perfect: 0, played: 0, hints: 0, dailyDone: 0, streak: 0, bestStreak: 0, lastDailyDate: "", noHintWins: 0, batWins: 0 }; persist(this.save); this.updateHome(); this.toast(t("resetProgress")); }
     toast(msg) { const el = $("toast"); el.textContent = msg; el.classList.add("show"); setTimeout(() => el.classList.remove("show"), 1800); }
 }
