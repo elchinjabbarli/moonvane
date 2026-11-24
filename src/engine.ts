@@ -1,6 +1,6 @@
 
 export const GEN_VERSION = 1;
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 export type Color = 0 | 1 | 2;
 export type Kind = 0 | 1;
 export interface Moth { x: number; y: number; c: Color; dx: number; dy: number; }
